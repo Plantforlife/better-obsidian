@@ -2,7 +2,7 @@
 
 Obsidian 桌面端增强插件，整合平滑同步滚动、自动双栏、文档分割管理、文件列表回收站与快捷重命名。当前版本 **1.0.0**，最低需要 Obsidian **1.7.0**。
 
-配套主题：[Codex](https://github.com/Plantforlife/obsidian-codex-theme)。插件可以独立使用，也为 Codex 的悬浮功能区提供文件列表可见性识别与文件夹选择反馈。
+配套主题：[Codex UI For Obsidian](https://github.com/Plantforlife/Codex-UI-For-Obsidian)。插件可以独立使用，也为 Codex UI For Obsidian 的悬浮功能区提供文件列表可见性识别与文件夹选择反馈。
 
 ## 安装
 
@@ -25,7 +25,7 @@ Obsidian 桌面端增强插件，整合平滑同步滚动、自动双栏、文�
 - **文件列表增强**：悬停显示垃圾桶图标，将文件移至 Obsidian 配置的回收站；默认启用二次确认。
 - **快捷重命名与删除**：默认使用 F2 和 Delete，可在插件设置中录制自己的快捷键。
 - **缩放控制**：启动时可重置窗口缩放为 100%，也提供立即重置命令。
-- **Codex 联动**：识别左侧文件列表是否可见，并保留文件夹点击反馈。
+- **Codex UI For Obsidian 联动**：识别左侧文件列表是否可见，并保留文件夹点击反馈。
 
 默认开启自动双栏、同步滚动、滚轮平滑处理和启动时恢复 100% 缩放。可在「设置 → Better Obsidian」分别关闭或调整。删除操作调用 Obsidian 的 `fileManager.trashFile`，回收站位置遵循 Obsidian 设置。
 
