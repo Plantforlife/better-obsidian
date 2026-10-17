@@ -1,0 +1,10 @@
+{
+  "name": "better-obsidian",
+  "version": "1.0.0",
+  "description": "Smooth scrolling, dual view and file explorer tools for Obsidian",
+  "main": "main.js",
+  "private": true,
+  "scripts": {
+    "check": "node --check main.js"
+  }
+}

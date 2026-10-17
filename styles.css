@@ -1,0 +1,79 @@
+/* Better Obsidian - File Explorer Trash Button */
+.nav-file-title {
+  position: relative;
+}
+
+/* 统一文件与文件夹列表项紧凑小间距 */
+.nav-files-container .nav-file-title,
+.nav-files-container .nav-folder-title {
+  padding-top: 5px !important;
+  padding-bottom: 5px !important;
+  margin-block: 1px !important;
+  min-height: 28px !important;
+  line-height: 18px !important;
+}
+
+.better-obsidian-trash-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  border-radius: var(--radius-s, 4px);
+  margin-inline-start: auto;
+  margin-inline-end: 2px;
+  color: var(--text-muted);
+  opacity: 0;
+  pointer-events: none;
+  background-color: transparent;
+  transition: opacity 0.15s ease, color 0.15s ease, background-color 0.15s ease, transform 0.1s ease;
+  cursor: pointer;
+  flex-shrink: 0;
+  z-index: 2;
+}
+
+.better-obsidian-trash-btn svg {
+  width: 14px;
+  height: 14px;
+  stroke: currentColor;
+  stroke-width: 1.8px;
+  fill: none;
+  display: block;
+}
+
+/* 仅在鼠标悬停当前文件行时显现；当前打开的文件不常驻显示 */
+.nav-file-title:hover .better-obsidian-trash-btn {
+  opacity: 0.65;
+  pointer-events: auto;
+}
+
+/* 鼠标悬停在垃圾桶图标本身：纯粹将图标颜色转为红色，背景使用极淡的柔和微光，不使用全红实心块 */
+.nav-file-title .better-obsidian-trash-btn:hover {
+  opacity: 1;
+  color: var(--text-error, #e05252);
+  background-color: var(--background-modifier-hover, rgba(255, 255, 255, 0.08));
+}
+
+/* Folder Selection Feedback (inherited from Codex) */
+.openai-ui-folder-current {
+  background-color: var(--nav-item-background-active, rgba(255, 255, 255, 0.08)) !important;
+  border-radius: var(--radius-s, 4px);
+}
+
+/* Hotkey Setting Styles */
+.better-obsidian-kbd {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 3px 8px;
+  font-size: 12px;
+  font-family: var(--font-monospace);
+  background-color: var(--background-primary-alt);
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 4px;
+  box-shadow: inset 0 -1px 0 var(--background-modifier-border);
+  color: var(--text-normal);
+  min-width: 48px;
+  margin-right: 8px;
+  user-select: none;
+}
