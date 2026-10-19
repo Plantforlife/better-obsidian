@@ -8,8 +8,217 @@ const {
   Modal,
   Notice,
   TFile,
-  TFolder
+  TFolder,
+  loadPrism
 } = require("obsidian");
+const { Decoration, ViewPlugin, WidgetType } = require("@codemirror/view");
+const { Text } = require("@codemirror/state");
+
+// Editor header metadata stays outside the document. The theme draws the card;
+// this extension supplies its language and a copy action in both editor modes.
+const CODE_LANGUAGE_ALIASES = {
+  js: "javascript", ts: "typescript", py: "python", markup: "html",
+  sh: "bash", shell: "bash", ps1: "powershell", yml: "yaml", md: "markdown",
+  txt: "text", plaintext: "text", "c++": "cpp", cs: "csharp", kt: "kotlin",
+  rs: "rust", rb: "ruby", docker: "dockerfile", tex: "latex"
+};
+function codeLanguage(value) {
+  const language = (value || "").trim().split(/\s+/, 1)[0].toLowerCase();
+  return CODE_LANGUAGE_ALIASES[language] || language;
+}
+
+function codeCardsInDocument(doc) {
+  const cards = [];
+  let open = null;
+  let listIndent = 0;
+  const finish = (end) => {
+    const codeFrom = open.number < doc.lines ? doc.line(open.number + 1).from : doc.length;
+    let code = doc.sliceString(codeFrom, Math.max(codeFrom, end));
+    if (open.quotes || open.indent) {
+      code = code.split("\n").map(line => {
+        for (let depth = 0; depth < open.quotes; depth++) line = line.replace(/^\s*> ?/, "");
+        return line.replace(new RegExp(`^ {0,${open.indent}}`), "");
+      }).join("\n");
+    }
+    cards.push({ from: open.from, to: open.to, language: open.language, code,
+      first: open.number - 1, last: doc.lineAt(Math.max(open.from, end)).number });
+    open = null;
+  };
+  for (let number = 1; number <= doc.lines; number++) {
+    const line = doc.line(number);
+    if (open) {
+      const close = line.text.match(/^([ \t]*(?:>[ \t]*)*)(`{3,}|~{3,})[ \t]*$/);
+      const closeQuotes = close ? (close[1].match(/>/g) || []).length : -1;
+      const closeIndent = close ? close[1].replace(/^[ \t]*(?:>[ \t]?)+/, "").length : 0;
+      if (close && closeQuotes === open.quotes && closeIndent <= open.indent + 3 && close[2][0] === open.marker && close[2].length >= open.length) finish(line.from - 1);
+      continue;
+    }
+    const list = line.text.match(/^([ \t]*(?:>[ \t]*)*)([-+*]|\d+[.)])([ \t]+)/);
+    if (list) listIndent = list[1].replace(/^[ \t]*(?:>[ \t]?)+/, "").length + list[2].length + list[3].length;
+    else if (line.text.trim() && !/^[ \t>]/.test(line.text)) listIndent = 0;
+    const match = line.text.match(/^([ \t]*(?:>[ \t]*)*)(?:((?:[-+*]|\d+[.)])[ \t]+))?(`{3,}|~{3,})(.*)$/);
+    if (!match || (match[3][0] === "`" && match[4].includes("`"))) continue;
+    // A fence indented four spaces outside a list is ordinary indented code.
+    const prefix = match[1];
+    const quotes = (prefix.match(/>/g) || []).length;
+    const indent = prefix.replace(/^[ \t]*(?:>[ \t]?)+/, "").length + (match[2] || "").length;
+    if (!quotes && !match[2] && indent > 3 && (!listIndent || indent < listIndent)) continue;
+    open = { number, from: line.from, to: line.to, marker: match[3][0], length: match[3].length, language: codeLanguage(match[4]), quotes, indent };
+  }
+  if (open) finish(doc.length);
+  return cards;
+}
+
+class CodeCardCopyWidget extends WidgetType {
+  constructor(code) { super(); this.code = code; }
+  eq(other) { return other.code === this.code; }
+  toDOM(view) {
+    const button = view.dom.ownerDocument.createElement("button");
+    button.className = "codex-code-copy";
+    button.type = "button";
+    button.setAttribute("aria-label", "复制代码");
+    button.title = "复制代码";
+    button.innerHTML = '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><rect x="8" y="8" width="12" height="13" rx="2"/><path d="M16 8V5a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h3"/></svg>';
+    button.addEventListener("pointerdown", event => { event.preventDefault(); event.stopPropagation(); });
+    button.addEventListener("click", async event => {
+      event.preventDefault();
+      event.stopPropagation();
+      try {
+        await view.dom.ownerDocument.defaultView.navigator.clipboard.writeText(this.code);
+        button.setAttribute("aria-label", "已复制");
+        button.title = "已复制";
+        button.dataset.copied = "true";
+      } catch (_) {
+        button.setAttribute("aria-label", "复制失败，请手动选择代码");
+        button.title = "复制失败，请手动选择代码";
+      }
+    });
+    button.addEventListener("mouseleave", () => {
+      button.removeAttribute("data-copied");
+      button.setAttribute("aria-label", "复制代码");
+      button.title = "复制代码";
+    });
+    return button;
+  }
+  ignoreEvent() { return true; }
+}
+
+// Match the native reading-mode Prism theme's token precedence, including
+// aliases and nested tokens. Sharing only palette variables is insufficient:
+// CodeMirror and Prism classify object keys, variables and types differently.
+const PRISM_COLORS = [
+  ["comment", ["comment", "prolog", "doctype", "cdata"]],
+  ["tag", ["tag", "constant", "symbol", "deleted"]],
+  ["punctuation", ["punctuation"]],
+  ["value", ["boolean", "number"]],
+  ["string", ["selector", "attr-name", "string", "char", "inserted"]],
+  ["operator", ["operator"]],
+  ["property", ["entity", "parameter", "property", "url", "variable"]],
+  ["function", ["atrule", "attr-value", "builtin", "function", "class-name", "property-access"]],
+  ["keyword", ["keyword"]],
+  ["important", ["regex", "important"]]
+];
+
+function prismCodeRuns(prism, code, language) {
+  const grammar = prism?.languages[language];
+  if (!grammar || code.length > 200000) return null;
+  const environment = { code, grammar, language };
+  prism.hooks.run("before-tokenize", environment);
+  environment.tokens = prism.tokenize(environment.code, environment.grammar);
+  prism.hooks.run("after-tokenize", environment);
+  const runs = [];
+  let position = 0;
+  const visit = (token, parent) => {
+    if (typeof token === "string") {
+      const from = position;
+      position += token.length;
+      if (position > from) runs.push({ from, to: position, ...parent });
+    } else if (Array.isArray(token)) {
+      token.forEach(child => visit(child, parent));
+    } else {
+      const types = [token.type, ...[token.alias || []].flat()];
+      const style = { ...parent };
+      for (const [color, names] of PRISM_COLORS) if (names.some(name => types.includes(name))) style.color = color;
+      if (types.includes("string") && (language === "css" || parent.style)) style.color = "property";
+      if (types.includes("style")) style.style = true;
+      if (types.includes("bold") || types.includes("important")) style.bold = true;
+      if (types.includes("italic")) style.italic = true;
+      if (types.includes("namespace")) style.dim = true;
+      visit(token.content, style);
+    }
+  };
+  visit(environment.tokens, { color: "normal" });
+  // A third-party Prism hook may transform text. Preserve editor offsets by
+  // falling back rather than applying decorations against a different string.
+  return position === code.length && environment.code === code ? runs : null;
+}
+
+function createCodeCardExtension(prism = null) {
+  return ViewPlugin.fromClass(class {
+    constructor(view) {
+      this.syntaxCache = new Map();
+      this.cards = codeCardsInDocument(view.state.doc);
+      this.decorations = this.build(view);
+    }
+    update(update) {
+      if (update.docChanged) this.cards = codeCardsInDocument(update.state.doc);
+      if (update.docChanged || update.viewportChanged) this.decorations = this.build(update.view);
+    }
+    build(view) {
+      const ranges = [];
+      const cache = new Map();
+      for (const card of this.cards) {
+        if (view.visibleRanges.some(range => card.to >= range.from && card.from <= range.to)) {
+          ranges.push(Decoration.line({ attributes: { class: "codex-code-start", "data-codex-language": card.language } }).range(card.from));
+          ranges.push(Decoration.widget({ widget: new CodeCardCopyWidget(card.code), side: 1 }).range(card.to));
+        }
+        const key = card.language + "\0" + card.code;
+        const previous = this.syntaxCache.get(key);
+        const runs = previous !== undefined ? previous : prismCodeRuns(prism, card.code, card.language);
+        cache.set(key, runs);
+        if (!runs) continue;
+        const lines = card.code.split("\n");
+        const positions = [];
+        let offset = 0;
+        for (let i = 0; i < lines.length; i++) {
+          const number = card.first + 2 + i;
+          if (number > view.state.doc.lines || number > card.last) break;
+          const line = view.state.doc.line(number);
+          positions.push({ start: offset, end: offset + lines[i].length, from: line.to - lines[i].length });
+          offset += lines[i].length + 1;
+          if (view.visibleRanges.some(range => line.to >= range.from && line.from <= range.to)) {
+            ranges.push(Decoration.line({ class: "codex-prism-line" }).range(line.from));
+          }
+        }
+        const starts = positions.map(line => line.start);
+        for (const run of runs) {
+          const style = `--codex-prism-color:var(--code-${run.color});` +
+            (run.bold ? "font-weight:bold;" : "") + (run.italic ? "font-style:italic;" : "") + (run.dim ? "opacity:.7;" : "");
+          for (let i = Math.max(0, lastAtMost(starts, run.from)); i < positions.length && positions[i].start < run.to; i++) {
+            const line = positions[i];
+            const from = line.from + Math.max(run.from - line.start, 0);
+            const to = line.from + Math.min(run.to, line.end) - line.start;
+            if (from >= to) continue;
+            for (const visible of view.visibleRanges) {
+              const a = Math.max(from, visible.from), b = Math.min(to, visible.to);
+              if (a < b) ranges.push(Decoration.mark({ class: "codex-prism-token", attributes: { style } }).range(a, b));
+            }
+          }
+        }
+      }
+      this.syntaxCache = cache;
+      return Decoration.set(ranges, true);
+    }
+  }, { decorations: value => value.decorations });
+}
+
+function addCodeCardLanguages(element) {
+  for (const code of element.querySelectorAll("pre > code")) {
+    const pre = code.parentElement;
+    const languageClass = [...code.classList, ...pre.classList].find(name => name.startsWith("language-"));
+    pre.dataset.codexLanguage = codeLanguage(pre.dataset.language || languageClass?.slice(9) || "");
+  }
+}
 
 const DEFAULTS = {
   // 滚动同步与双栏
@@ -136,6 +345,7 @@ class PreviewBridge {
     this.renderer = renderer;
     this.scrollEl = renderer.previewEl;
     this.contentEl = renderer.sizerEl || renderer.previewEl;
+    this.codeMeasurements = new WeakMap();
   }
   prepare() {
     const el = this.scrollEl, r = this.renderer;
@@ -175,6 +385,85 @@ class PreviewBridge {
     if (tops.length) { heights[0] += tops[0]; tops[0] = 0; }
     this.starts = starts; this.tops = tops; this.heights = heights;
     this.endLine = line; this.endY = y;
+    this.refineCodePositions(sections);
+  }
+  refineCodePositions(sections) {
+    // A fence has a header, individual (possibly wrapped) code lines and a
+    // footer. Interpolating the whole section distributes the header's height
+    // across the code and progressively shifts the other pane out of alignment.
+    const text = this.renderer.text;
+    this.codeRanges = [];
+    if (typeof text !== "string" || !this.starts.length) return;
+    if (text !== this.codeText) {
+      this.codeText = text;
+      this.codeCards = codeCardsInDocument(Text.of(text.split("\n")));
+    }
+    if (!this.codeCards.length) return;
+    const points = new Map(this.starts.map((start, i) => [start, this.tops[i]]));
+    points.set(this.endLine, this.endY);
+    const scrollTop = this.scrollEl.getBoundingClientRect().top + this.scrollEl.clientTop - this.top;
+    const used = new Set();
+    for (const section of sections) {
+      if (section.shown === false || !section.el?.isConnected) continue;
+      const start = finite(section.start?.line) ? section.start.line : 0;
+      const end = start + (section.lines || 0);
+      for (const code of section.el.querySelectorAll("pre > code")) {
+        const content = code.textContent.replace(/\n$/, "");
+        const card = this.codeCards.find(card => !used.has(card) && card.first >= start && card.first < end && card.code === content);
+        if (!card) continue; // Rendered diagrams and transformed code use the section fallback.
+        const rect = code.getBoundingClientRect();
+        if (!rect.height || !rect.width) continue;
+        used.add(card);
+        const offsets = this.measureCodeLines(code, rect);
+        const sectionIndex = lastAtMost(this.starts, card.first);
+        const lo = this.tops[sectionIndex], hi = lo + this.heights[sectionIndex];
+        const put = (line, y) => {
+          if (line > card.first && line < this.endLine) points.set(line, clamp(y - scrollTop, lo, hi));
+        };
+        offsets.forEach((offset, i) => put(card.first + 1 + i, rect.top + offset));
+        put(card.last, rect.bottom);
+        this.codeRanges.push([card.first, card.last + 1]);
+      }
+    }
+    const sorted = [...points].sort((a, b) => a[0] - b[0]);
+    // Keep the renderer's virtualized section estimates outside measured code.
+    this.starts = sorted.slice(0, -1).map(point => point[0]);
+    this.tops = sorted.slice(0, -1).map(point => point[1]);
+    this.heights = sorted.slice(0, -1).map((point, i) => Math.max(0, sorted[i + 1][1] - point[1]));
+  }
+  measureCodeLines(code, rect) {
+    const win = code.ownerDocument.defaultView;
+    const style = win.getComputedStyle(code);
+    const lineHeight = parseFloat(style.lineHeight) || parseFloat(style.fontSize) * 1.5 || 24;
+    const signature = [code.textContent, rect.width, rect.height, lineHeight].join("\0");
+    const cached = this.codeMeasurements.get(code);
+    if (cached?.signature === signature) return cached.offsets;
+    const document = code.ownerDocument;
+    const walker = document.createTreeWalker(code, 4 /* SHOW_TEXT */);
+    const nodes = [];
+    let node, length = 0;
+    while ((node = walker.nextNode())) { nodes.push({ node, from: length }); length += node.length; }
+    const lines = code.textContent.replace(/\n$/, "").split("\n");
+    const offsets = [];
+    let position = 0, index = 0, firstTop;
+    const range = document.createRange();
+    for (const line of lines) {
+      while (index + 1 < nodes.length && position >= nodes[index].from + nodes[index].node.length) index++;
+      const entry = nodes[index];
+      let offset = offsets.length ? offsets[offsets.length - 1] + lineHeight : 0;
+      if (entry && position < length) {
+        const at = position - entry.from;
+        range.setStart(entry.node, at);
+        range.setEnd(entry.node, Math.min(at + 1, entry.node.length));
+        const box = range.getBoundingClientRect();
+        if (firstTop === undefined) firstTop = box.top - offset;
+        offset = Math.round((box.top - firstTop) / lineHeight) * lineHeight;
+      }
+      offsets.push(offset);
+      position += line.length + 1;
+    }
+    this.codeMeasurements.set(code, { signature, offsets });
+    return offsets;
   }
   next(k) {
     return k + 1 < this.starts.length ? this.starts[k + 1] : this.endLine;
@@ -273,6 +562,9 @@ class PairMap {
   }
   smoothed(s) {
     const L = this.L;
+    const preview = L.kind === "preview" ? L : this.F.kind === "preview" ? this.F : null;
+    const line = L.lineAt(s);
+    if (preview?.codeRanges?.some(([from, to]) => line >= from && line < to)) return this.at(s);
     if (L.max <= 0) return this.at(s);
     const half = Math.min(L.height * BLEND / 2, s, L.max - s);
     return half >= 0.5 ? this.average(s - half, s + half) : this.at(s);
@@ -828,6 +1120,11 @@ class ConfirmDeleteModal extends Modal {
 module.exports = class BetterObsidianPlugin extends Plugin {
   async onload() {
     this.settings = Object.assign({}, DEFAULTS, await this.loadData());
+    let prism = null;
+    try { prism = await loadPrism(); }
+    catch (error) { console.warn("Better Obsidian: Prism unavailable, keeping native editor highlighting", error); }
+    this.registerEditorExtension(createCodeCardExtension(prism));
+    this.registerMarkdownPostProcessor(addCodeCardLanguages);
 
     // 0. 重置并锁定缩放比例为 100% (zoom = 0)
     if (this.settings.lockDefaultZoom !== false) {
@@ -882,6 +1179,7 @@ module.exports = class BetterObsidianPlugin extends Plugin {
       this.watchFolderSelection();
       this.watchFileExplorerKeys();
       this.scheduleExplorerUpdate();
+      this.scheduleAutoDual();
     });
 
     // 6. 注册设置页

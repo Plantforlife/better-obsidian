@@ -1,7 +1,7 @@
 {
   "id": "better-obsidian",
   "name": "Better Obsidian",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "minAppVersion": "1.7.0",
   "description": "平滑同步滚动、自动双栏、文档分割管理、文件列表回收站与快捷重命名等增强工具合集。",
   "author": "Local",

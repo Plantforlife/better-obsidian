@@ -1,4 +1,19 @@
 /* Better Obsidian - File Explorer Trash Button */
+/* Code-card controls are activated visually by the companion theme. */
+.codex-code-copy {
+  display: none;
+}
+
+/* Editor fences use the same Prism token stream as reading mode. Reset the
+   nested native CodeMirror colors; its token boundaries may be different. */
+.markdown-source-view.mod-cm6 .cm-line.codex-prism-line span:not(.codex-prism-token) {
+  color: inherit !important;
+}
+
+.markdown-source-view.mod-cm6 .cm-line.codex-prism-line .codex-prism-token {
+  color: var(--codex-prism-color, var(--code-normal)) !important;
+}
+
 .nav-file-title {
   position: relative;
 }
@@ -14,22 +29,52 @@
 }
 
 .better-obsidian-trash-btn {
+  position: absolute;
+  inset-inline-end: 6px;
+  top: 50%;
+  transform: translateY(-50%);
   display: flex;
   align-items: center;
   justify-content: center;
   width: 20px;
   height: 20px;
   border-radius: var(--radius-s, 4px);
-  margin-inline-start: auto;
-  margin-inline-end: 2px;
+  margin: 0;
   color: var(--text-muted);
   opacity: 0;
+  visibility: hidden;
   pointer-events: none;
   background-color: transparent;
-  transition: opacity 0.15s ease, color 0.15s ease, background-color 0.15s ease, transform 0.1s ease;
+  transition: color 0.15s ease, background-color 0.15s ease;
   cursor: pointer;
   flex-shrink: 0;
   z-index: 2;
+}
+
+/* The extension label and trash share the trailing slot. Keep the label's
+   layout space during hover so filenames never jump or run under the button. */
+.nav-file-title:has(.better-obsidian-trash-btn) {
+  padding-inline-end: 8px;
+}
+
+.nav-file-title:has(.better-obsidian-trash-btn):not(:has(.nav-file-tag)) {
+  padding-inline-end: 32px;
+}
+
+.nav-file-title:has(.better-obsidian-trash-btn) .nav-file-title-content {
+  min-width: 0;
+}
+
+.nav-file-title:has(.better-obsidian-trash-btn) .nav-file-tag {
+  flex-shrink: 0;
+  min-width: 20px;
+  margin-inline-start: auto;
+  padding-inline: 4px 0;
+  text-align: end;
+}
+
+.nav-file-title:hover:has(.better-obsidian-trash-btn) .nav-file-tag {
+  visibility: hidden;
 }
 
 .better-obsidian-trash-btn svg {
@@ -43,8 +88,14 @@
 
 /* 仅在鼠标悬停当前文件行时显现；当前打开的文件不常驻显示 */
 .nav-file-title:hover .better-obsidian-trash-btn {
+  visibility: visible;
   opacity: 0.65;
   pointer-events: auto;
+}
+
+.nav-file-title:is(.is-being-renamed, :has([contenteditable="true"])) .better-obsidian-trash-btn {
+  visibility: hidden;
+  pointer-events: none;
 }
 
 /* 鼠标悬停在垃圾桶图标本身：纯粹将图标颜色转为红色，背景使用极淡的柔和微光，不使用全红实心块 */
