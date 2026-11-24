@@ -1151,6 +1151,7 @@ module.exports = class BetterObsidianPlugin extends Plugin {
       this.controller.remember(leaf);
       if (this.controller.documents().includes(leaf)) this.clearFolderSelection();
       this.scheduleRibbonUpdate?.();
+      if (leaf?.view instanceof MarkdownView) this.scheduleAutoDual();
     }));
 
     this.registerEvent(this.app.workspace.on("layout-change", () => {
@@ -1208,12 +1209,12 @@ module.exports = class BetterObsidianPlugin extends Plugin {
 
     // 双栏与同步
     const dualTitle = "对半分：源码 / 阅读";
-    this.addRibbonIcon("columns-2", dualTitle, () => this.sync.guard("dual view", () => this.toggleDualView()));
+    this.addRibbonIcon("columns-2", dualTitle, () => this.runDual(() => this.toggleDualView()));
     this.addCommand({
       id: "dual-view",
-      name: `${dualTitle}（再次执行恢复单栏）`,
+      name: `${dualTitle}（再次执行关闭当前阅读视图）`,
       icon: "columns-2",
-      callback: () => this.sync.guard("dual view", () => this.toggleDualView())
+      callback: () => this.runDual(() => this.toggleDualView())
     });
 
     this.addCommand({
@@ -1265,7 +1266,7 @@ module.exports = class BetterObsidianPlugin extends Plugin {
       checkCallback: (checking) => {
         if (!this.settings.enableDelHotkey) return false;
         const target = this.resolveCurrentTargetFile();
-        if (!target) return false;
+        if (!(target instanceof TFile)) return false;
         if (checking) return true;
         this.confirmTrashFile(target);
         return true;
@@ -1290,17 +1291,18 @@ module.exports = class BetterObsidianPlugin extends Plugin {
 
   // ----------------- 文件与回收站处理 -----------------
   resolveCurrentTargetFile() {
-    const doc = activeDocument || document;
+    const ws = this.app.workspace;
+    const doc = activeDocument || ws.containerEl.ownerDocument;
     const activeEl = doc.activeElement;
-    const inExplorer = activeEl?.closest?.('.workspace-leaf-content[data-type="file-explorer"]');
-    if (inExplorer && this.lastHoveredOrClickedFile) {
-      return this.lastHoveredOrClickedFile;
-    }
-    const explorerView = this.app.workspace.getLeavesOfType("file-explorer")[0]?.view;
-    const focused = explorerView?.tree?.focusedItem?.file || explorerView?.activeDom?.file;
-    if (inExplorer && focused) return focused;
+    const explorer = activeEl?.closest?.('.workspace-leaf-content[data-type="file-explorer"]');
+    const view = explorer
+      ? ws.getLeavesOfType("file-explorer").find(leaf => leaf.view.containerEl === explorer)?.view
+      : ws.activeLeaf?.view.getViewType() === "file-explorer" ? ws.activeLeaf.view : null;
+    if (!view) return explorer ? null : ws.getActiveFile();
 
-    return this.app.workspace.getActiveFile() || focused || this.lastHoveredOrClickedFile || null;
+    const item = view.tree ? view.tree.focusedItem || view.tree.activeDom : view.activeDom;
+    const file = item?.file;
+    return file && this.app.vault.getAbstractFileByPath(file.path) === file ? file : null;
   }
 
   async confirmTrashFile(file) {
@@ -1369,19 +1371,6 @@ module.exports = class BetterObsidianPlugin extends Plugin {
 
   watchFileExplorerKeys() {
     const doc = this.app.workspace.containerEl.ownerDocument;
-    this.registerDomEvent(doc, "pointerover", (event) => {
-      const target = event.target?.closest?.(".nav-file-title, .nav-folder-title");
-      if (!target) return;
-      const explorerView = this.app.workspace.getLeavesOfType("file-explorer")[0]?.view;
-      if (!explorerView?.fileItems) return;
-      for (const [path, item] of Object.entries(explorerView.fileItems)) {
-        if (item.selfEl === target) {
-          this.lastHoveredOrClickedFile = item.file;
-          break;
-        }
-      }
-    });
-
     this.registerDomEvent(doc, "keydown", (event) => {
       const activeEl = doc.activeElement;
       const isInput = activeEl && (
@@ -1495,32 +1484,67 @@ module.exports = class BetterObsidianPlugin extends Plugin {
     return recent?.view instanceof MarkdownView ? recent : null;
   }
 
-  groupPartners(leaf) {
-    const list = [];
-    if (!leaf?.group) return list;
-    this.app.workspace.iterateRootLeaves((other) => {
-      if (other !== leaf && other.group === leaf.group && other.parent !== leaf.parent) list.push(other);
-    });
-    return list;
+  dualPair(leaf) {
+    const ws = this.app.workspace;
+    if (typeof leaf?.group !== "string" || !leaf.group.startsWith("dual-") || leaf.getRoot() !== ws.rootSplit) return null;
+    const leaves = ws.getGroupLeaves(leaf.group);
+    if (leaves.length !== 2) return null;
+    const partner = leaves.find(other => other !== leaf);
+    if (!partner || partner.getRoot() !== ws.rootSplit || partner.parent === leaf.parent) return null;
+    const states = leaves.map(item => item.getViewState());
+    if (states.some(state => state.type !== "markdown" || !state.state?.file)) return null;
+
+    // Obsidian's new-note command can switch the reader to source mode. When
+    // both modes match, the root layout order identifies the editor and reader.
+    const preview = states.map(state => state.state.mode === "preview");
+    const reading = preview[0] !== preview[1] ? leaves[preview[0] ? 0 : 1] : leaves[1];
+    return { source: leaves.find(item => item !== reading), reading };
+  }
+
+  neighboringDualPair(leaf) {
+    const tabs = leaf.parent.children.filter(tab => tab !== leaf);
+    tabs.sort((a, b) => b.activeTime - a.activeTime);
+    for (const tab of tabs) {
+      const pair = this.dualPair(tab);
+      if (pair) return pair;
+    }
+    return null;
+  }
+
+  async runDual(action) {
+    if (this.dualBusy || this.disposed) return;
+    this.dualBusy = true;
+    try {
+      await action();
+    } catch (error) {
+      console.error("Better Obsidian: dual view failed", error);
+    } finally {
+      this.dualBusy = false;
+      if (this.dualPending) {
+        this.dualPending = false;
+        this.scheduleAutoDual();
+      }
+    }
   }
 
   async toggleDualView() {
     const ws = this.app.workspace;
-    const source = this.targetLeaf();
-    const file = source?.view.file;
-    if (!file) {
+    const leaf = this.targetLeaf();
+    const file = leaf?.view.file;
+    if (!file || leaf.getRoot() !== ws.rootSplit) {
       new Notice("请先打开一篇 Markdown 笔记");
       return;
     }
-    const paired = this.groupPartners(source).find((leaf) => leaf.view instanceof MarkdownView && leaf.view.getMode() === "preview");
-    if (paired) {
-      paired.detach();
-      source.setGroup(null);
-      this.dualDeclined = { leaf: source, file };
-      ws.setActiveLeaf(source, { focus: true });
+    const pair = this.dualPair(leaf);
+    if (pair) {
+      this.dualDeclined = { leaf: pair.source, file };
+      pair.source.setGroup(null);
+      ws.setActiveLeaf(pair.source, { focus: true });
+      pair.reading.detach();
       return;
     }
-    await this.ensureDual(source);
+    this.dualDeclined = null;
+    await this.ensureDual(leaf, this.neighboringDualPair(leaf), true);
   }
 
   takeCreated(file) {
@@ -1530,118 +1554,127 @@ module.exports = class BetterObsidianPlugin extends Plugin {
     return true;
   }
 
-  async normalizeDual(leaves) {
-    const md = leaves.filter((leaf) => leaf.view instanceof MarkdownView && leaf.view.file);
-    if (md.length < 2) return;
-    md.sort((a, b) => a.view.containerEl.getBoundingClientRect().left - b.view.containerEl.getBoundingClientRect().left);
-    const file = md[0].view.file;
-    this.dualBusy = true;
-    try {
-      const [source, ...readers] = md;
-      const state = source.getViewState();
-      if (state.state?.mode !== "source" || state.state?.source !== true) {
-        await source.setViewState({ ...state, state: { ...state.state, file: file.path, mode: "source", source: true } });
-      }
-      for (const leaf of readers) {
-        if (leaf.view.file !== file || leaf.view.getMode() !== "preview") {
-          await leaf.setViewState({ type: "markdown", state: { file: file.path, mode: "preview", source: false }, active: false });
-        }
-      }
-      this.app.workspace.setActiveLeaf(source, { focus: true });
-      this.sync.alignNow();
-    } finally {
-      this.dualBusy = false;
-    }
-  }
-
   async autoDual() {
     const ws = this.app.workspace;
-    if (!this.settings.autoDual || this.dualBusy) return;
-    const leaf = ws.getActiveViewOfType(MarkdownView)?.leaf;
-    if (!leaf?.view.file || leaf.view.file.extension !== "md") return;
-    if (typeof leaf.getRoot === "function" && leaf.getRoot() !== ws.rootSplit) return;
-    const partners = this.groupPartners(leaf);
-    if (partners.length) {
-      if (this.takeCreated(leaf.view.file)) await this.normalizeDual([leaf, ...partners]);
+    const leaf = ws.activeLeaf;
+    const file = leaf?.view instanceof MarkdownView && leaf.view.file;
+    if (file?.extension !== "md" || leaf.getRoot() !== ws.rootSplit || this.controller.busy) return;
+    const pair = this.dualPair(leaf);
+    const created = this.takeCreated(file);
+    if (pair) {
+      if (created) {
+        await this.setDualMode(pair.source, file, "source");
+        if (this.disposed || ws.activeLeaf !== leaf || leaf.view.file !== file) return;
+        await this.setDualMode(pair.reading, file, "preview");
+        if (this.disposed || ws.activeLeaf !== leaf || leaf.view.file !== file) return;
+        ws.setActiveLeaf(pair.source, { focus: true });
+      }
+      // Tab selection on the other side keeps focus in the pane the user chose.
+      const partner = leaf === pair.source ? pair.reading : pair.source;
+      partner.parent?.selectTab?.(partner);
       return;
     }
-    if (await this.replaceWithNewNote(leaf)) return;
-    if (this.dualDeclined?.leaf === leaf && this.dualDeclined.file === leaf.view.file) return;
+    if (this.dualDeclined?.leaf === leaf && this.dualDeclined.file === file) return;
     this.dualDeclined = null;
-    await this.ensureDual(leaf);
+    const neighbor = this.neighboringDualPair(leaf);
+    if (created && neighbor && !leaf.pinned && !leaf.group && !neighbor.source.pinned) {
+      await neighbor.source.openFile(file, { active: false, state: { mode: "source", source: true } });
+      if (this.disposed || ws.activeLeaf !== leaf || leaf.view.file !== file || neighbor.source.view.file !== file) return;
+      await this.setDualMode(neighbor.reading, file, "preview");
+      if (this.disposed || ws.activeLeaf !== leaf || leaf.view.file !== file) return;
+      ws.setActiveLeaf(neighbor.source, { focus: true });
+      neighbor.source.setEphemeralState({ rename: "all" });
+      leaf.detach();
+      this.sync.alignNow();
+      return;
+    }
+    await this.ensureDual(leaf, neighbor, false);
   }
 
-  async ensureDual(source) {
+  async setDualMode(leaf, file, mode) {
+    const state = leaf.getViewState();
+    const source = mode === "source";
+    if (state.type === "markdown" && state.state?.file === file.path &&
+        state.state.mode === mode && (!source || state.state.source === true)) return;
+    const previous = state.type === "markdown" && state.state?.file === file.path ? state.state : {};
+    await leaf.setViewState({ type: "markdown", state: { ...previous, file: file.path, mode, source }, active: false });
+  }
+
+  async ensureDual(leaf, neighbor, manual) {
     const ws = this.app.workspace;
-    const file = source.view.file;
-    if (this.dualBusy || !file) return;
-    this.dualBusy = true;
+    const file = leaf.view.file;
+    const active = ws.activeLeaf;
+    if (leaf.group && (typeof leaf.group !== "string" || !leaf.group.startsWith("dual-") ||
+        ws.getGroupLeaves(leaf.group).length > 1)) return;
+    let otherPane = false;
+    let matchingReader;
+    ws.iterateRootLeaves(other => {
+      if (other.parent === leaf.parent) return;
+      otherPane = true;
+      const state = other.getViewState();
+      if (!matchingReader && manual && !other.group && state.type === "markdown" &&
+          state.state?.file === file.path && state.state.mode === "preview") matchingReader = other;
+    });
+    // A different split may be intentional. Automatic mode only splits a single
+    // column, or adds a tab to an existing Better Obsidian pair.
+    if (!manual && otherPane && !neighbor) return;
+    const openedOnReadingSide = neighbor?.reading.parent === leaf.parent;
+    const opposite = neighbor && (openedOnReadingSide ? neighbor.source : neighbor.reading);
+    if (opposite && typeof ws.createLeafInTabGroup !== "function") return;
+    const existingTabs = opposite?.parent.children.slice();
+    let added;
+    let source = leaf;
+    let reading = opposite ? null : matchingReader;
     try {
-      let reading = null, previous = null;
-      ws.iterateRootLeaves((leaf) => {
-        if (leaf === source || leaf.parent === source.parent || !(leaf.view instanceof MarkdownView)) return;
-        if (!reading && leaf.view.file === file) reading = leaf;
-        if (!previous && leaf.group && leaf.view.getMode() === "preview" && source.parent?.children?.some((tab) => tab !== source && tab.group === leaf.group)) previous = leaf;
-      });
-      if (!reading && previous) {
-        for (const tab of source.parent.children) if (tab !== source && tab.group === previous.group) tab.setGroup(null);
-        reading = previous;
+      if (openedOnReadingSide) {
+        added = source = ws.createLeafInTabGroup(opposite.parent);
+        reading = leaf;
+      } else if (!reading) {
+        added = reading = opposite ? ws.createLeafInTabGroup(opposite.parent) : ws.createLeafBySplit(leaf, "vertical");
       }
-      const created = !reading;
-
-      const state = source.getViewState();
-      if (state.state?.mode !== "source" || state.state?.source !== true) {
-        await source.setViewState({ ...state, state: { ...state.state, mode: "source", source: true } });
-      }
-      if (created) reading = ws.createLeafBySplit(source, "vertical");
-      await reading.setViewState({ type: "markdown", state: { file: file.path, mode: "preview", source: false }, active: false });
-      if (!created && typeof ws.revealLeaf === "function") await ws.revealLeaf(reading);
-
-      const group = source.group || reading.group || `dual-${Date.now().toString(36)}`;
+      const stillOpening = () => !this.disposed && leaf.view.file === file &&
+        (ws.activeLeaf === active || ws.activeLeaf === leaf || (added && ws.activeLeaf === added));
+      if (openedOnReadingSide) await this.setDualMode(source, file, "source");
+      else await this.setDualMode(reading, file, "preview");
+      if (!stillOpening()) return;
+      await this.setDualMode(leaf, file, openedOnReadingSide ? "preview" : "source");
+      if (!stillOpening()) return;
+      const group = `dual-${source.id}-${reading.id}`;
       source.setGroup(group);
       reading.setGroup(group);
+      added = null;
 
+      // The previous unpinned preview is a generated view. Keep its editor tab
+      // and recycle the reading column for the newly selected note.
+      if (neighbor?.reading.parent === reading.parent && !neighbor.reading.pinned &&
+          neighbor.reading.getViewState().state?.mode === "preview") {
+        neighbor.source.setGroup(null);
+        neighbor.reading.detach();
+      }
       const a = source.parent, b = reading.parent;
-      if (created && a && b && a !== b && a.parent === b.parent && a.parent?.children?.length === 2 && typeof a.setDimension === "function") {
+      if (!otherPane && a.parent === b.parent && a.parent?.children?.length === 2 && typeof a.setDimension === "function") {
         a.setDimension(50);
         b.setDimension(50);
       }
+      reading.parent.selectTab?.(reading);
       ws.setActiveLeaf(source, { focus: true });
       ws.requestSaveLayout?.();
       this.sync.alignNow();
     } finally {
-      this.dualBusy = false;
+      // A user can navigate away while Obsidian loads the duplicate view.
+      if (added?.parent && !existingTabs?.includes(added) && !added.pinned && !added.group &&
+          (!added.view.file || added.view.file === file)) added.detach();
     }
   }
 
   scheduleAutoDual() {
-    if (!this.settings.autoDual || !this.layoutReady) return;
+    if (!this.settings.autoDual || !this.layoutReady || this.disposed) return;
     window.clearTimeout(this.autoDualTimer);
-    this.autoDualTimer = window.setTimeout(() => this.sync.guard("auto dual", () => this.autoDual()), 80);
-  }
-
-  async replaceWithNewNote(leaf) {
-    const file = leaf.view.file;
-    if (!this.takeCreated(file)) return false;
-    const host = leaf.parent?.children?.find((tab) => tab !== leaf && tab.view instanceof MarkdownView &&
-      this.groupPartners(tab).some((partner) => partner.view instanceof MarkdownView && partner.view.getMode() === "preview"));
-    if (!host) return false;
-    this.dualBusy = true;
-    try {
-      await host.openFile(file, { active: true, state: { mode: "source", source: true }, eState: { rename: "all" } });
-      leaf.detach();
-      for (const partner of this.groupPartners(host)) {
-        if (!(partner.view instanceof MarkdownView)) continue;
-        if (partner.view.file !== file || partner.view.getMode() !== "preview") {
-          await partner.setViewState({ type: "markdown", state: { file: file.path, mode: "preview", source: false }, active: false });
-        }
-      }
-      this.app.workspace.setActiveLeaf(host, { focus: true });
-      this.sync.alignNow();
-    } finally {
-      this.dualBusy = false;
-    }
-    return true;
+    this.autoDualTimer = window.setTimeout(() => {
+      if (!this.settings.autoDual) return;
+      if (this.dualBusy) this.dualPending = true;
+      else void this.runDual(() => this.autoDual());
+    }, 80);
   }
 
   patchNative() {
@@ -1684,6 +1717,7 @@ module.exports = class BetterObsidianPlugin extends Plugin {
     this.sync.peersDirty = true;
     this.sync.refresh();
     this.scheduleExplorerUpdate();
+    if (patch.autoDual) this.scheduleAutoDual();
   }
 
   onunload() {
